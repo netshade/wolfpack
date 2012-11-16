@@ -1,0 +1,10 @@
+GEM
+  remote: http://rubygems.org/
+  specs:
+    eventmachine (1.0.0-java)
+
+PLATFORMS
+  java
+
+DEPENDENCIES
+  eventmachine
