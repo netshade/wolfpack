@@ -1,78 +1,88 @@
 require 'thread'
+require 'wolfpack/response'
 java_import java.util.concurrent.Executors
 java_import java.util.concurrent.Semaphore
 
 module Wolfpack
 
   class Job
-    def initialize(job_klass, request, args, observers)
+    def initialize(job_klass, request, observers, job_queue)
       @klass = job_klass
       @request = request
       @observers = observers
-      @arguments = args
+      @queue = job_queue
+      @response = Wolfpack::Response.new(observers)
     end
 
     def call()
-      job = @klass.new(*@arguments)
-      if job.respond_to?(:run)
-        result = job.run(@request)
-      else
-        result = ""
-      end
-      unless result.is_a?(Array)
-        result = [200, {}, result]
-      end
-      @observers.notify(result)
+      job = @klass.new()
+      job.run(@request, @response)
+      @response.flush
+      @observers.close
     rescue Exception => e
       puts "ERROR: %s\n%s" % [e.message, e.backtrace.join("\n")]
-      @callback.call [500, {}, "ERROR"]
+      begin
+        @response.status(500, "INTERNAL ERROR")
+        @response.write("%s\n%s\n" % [e.message, e.backtrace.join("\n")])
+        @response.flush
+        @observers.close
+      rescue Exception => ex
+        puts "INTERNAL ERROR\n%s\n%s" % [ex.message, ex.backtrace.join("\n")]
+      end
+    ensure
+      EM::next_tick do
+        @queue.remove(@klass, @observers) # TODO: this pattern is falling apart, think of something better
+      end
     end
-  end
-
-  class JobObserver
-
-    def initialize(block)
-      @callback = block
-    end
-
-    def notify(result)
-      @callback.call result
-    end
-
   end
 
   class ObserverQueue
 
     def initialize()
-      @queue = Queue.new
+      @clients = []
       @semaphore = Semaphore.new(1)
-      @acquired = false
+      @accepting = true
     end
 
-    def notify(result)
-      served = 0
-      while @queue.size > 0
-        observer = @queue.pop
-        observer.notify(result)
-        served += 1
+    def stop_accepting!
+      @accepting, original = false, @accepting
+      if original
+        @semaphore.acquire
       end
-    ensure
-      if @acquired
-        @acquired = false
-        @semaphore.release
+    end
+
+    # When emit is first called it stops this particular queue from accepting clients
+    # to allow jobs to start writing results directly to queued clients
+    # Not sure if I should do it this way or keep the results buffered and keep accepting
+    # clients.  TODO: Benchmark / investigate
+    def emit(data)
+      stop_accepting!
+      @clients.each do |observer|
+        observer.safewrite(data)
+      end
+    end
+
+
+    def close()
+      stop_accepting!
+      @clients.each do |observer|
+        observer.safeclose
       end
     end
 
     def add(observer)
-      @queue << observer
+      if @semaphore.tryAcquire
+        @clients << observer
+        @semaphore.release
+        true
+      else
+        false
+      end
     end
     alias_method :<<, :add
 
-    def call_if_ready(&block)
-      if @semaphore.tryAcquire
-        @acquired = true
-        yield
-      end
+    def size
+      @clients.size
     end
 
   end
@@ -80,17 +90,30 @@ module Wolfpack
   class JobQueue
 
     def initialize
-      @queue = Queue.new
       @observers = {}
+      #@thread_pool = Executors.newFixedThreadPool(4)
       @thread_pool = Executors.newCachedThreadPool
     end
 
-    def enqueue(job_klass, request, *args , &block)
-      @observers[job_klass] ||= ObserverQueue.new
-      observer = JobObserver.new(block)
-      @observers[job_klass] << observer
-      @observers[job_klass].call_if_ready do
-        @thread_pool.submit Job.new(job_klass, request, args, @observers[job_klass])
+    def enqueue(job_klass, request, client)
+      @observers[job_klass] ||= []
+      if last_queue = @observers[job_klass].last
+        if !last_queue.add(client)
+          last_queue = nil
+        end
+      end
+      if !last_queue
+        last_queue = ObserverQueue.new
+        last_queue.add(client)
+        @observers[job_klass] << last_queue
+        @thread_pool.submit Job.new(job_klass, request, last_queue, self)
+      end
+    end
+
+    def remove(klass, observers)
+      if @observers[klass]
+        @observers[klass].delete(observers)
+        puts "Served %i requests" % [observers.size]
       end
     end
 

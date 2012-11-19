@@ -1,7 +1,8 @@
 class TestJob
 
-  def run(request)
-    "TestJobRan!" + request.headers.inspect
+  def run(request, response)
+    response.status(200, "OK")
+    response.write("TestJobRan!" + request.headers.inspect)
   end
 
 end

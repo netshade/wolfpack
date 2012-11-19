@@ -12,28 +12,40 @@ module Wolfpack
       super
       @server = srv
       @parser = Wolfpack::Parser.new
+      @closed = false
     end
 
     def receive_data(data)
       @parser.parse(data)
       if @parser.error?
-        send_data("500 FUUUUUU\n")
+        send_data("400 BAD REQUEST\n")
         close_connection_after_writing
       else
         if @parser.finished?
           job_klass = server.recognize(@parser.request.request_path)
-          @server.enqueue(job_klass, @parser.request) do |result|
-            status, headers, body = result
-            headers["Content-Length"] ||= body.size
-            header_str = headers.collect { |k, v| "%s: %s" % [k, v] }.join("\n")
-            send_data("HTTP/1.1 #{status}\n" +
-              header_str + "\n\n" +
-              body
-            )
-            close_connection_after_writing
-          end
+          @server.enqueue(job_klass, @parser.request, self)
         end
       end
+    end
+
+    def safewrite(data)
+      EM::next_tick do
+        if !@closed
+          send_data(data)
+        end
+      end
+    end
+
+    def safeclose()
+      EM::next_tick do
+        if !@closed
+          close_connection_after_writing
+        end
+      end
+    end
+
+    def unbind
+      @closed = true
     end
   end
 
@@ -48,15 +60,13 @@ module Wolfpack
       @router.recognize(uri)
     end
 
-    def enqueue(sender, request, &block)
-      @queue.enqueue(sender, request) do |args|
-        EM::next_tick do
-          block.call(args)
-        end
-      end
+    def enqueue(sender, request, client)
+      @queue.enqueue(sender, request, client)
     end
 
     def run
+      EM.epoll
+      EM.set_descriptor_table_size( 64_000 )
       EventMachine.run {
         EventMachine.start_server '0.0.0.0', 1337, Wolfpack::HttpClient, self
       }
